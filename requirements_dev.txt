@@ -9,3 +9,4 @@ Sphinx
 twine
 pytest
 pytest-runner
+ibapi
