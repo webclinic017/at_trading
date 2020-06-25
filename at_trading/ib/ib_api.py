@@ -5,6 +5,7 @@ import signal  # doesn't work on windows
 from typing import List, Dict
 from functools import reduce
 
+from ibapi.account_summary_tags import AccountSummaryTags
 from ibapi.client import EClient, SmartComponentMap, TickAttribLast, TickAttribBidAsk, \
     BarData, HistogramData
 from ibapi.contract import Contract, ContractDetails
@@ -79,7 +80,7 @@ class timeout:
         signal.alarm(0)
 
 
-def blocking(func, timeout_seconds=10):
+def blocking(func, timeout_seconds=3):
     def _blocking_decorator(self, *args, **kwargs):
         logger = logging.getLogger(__name__)
         data_result = None
@@ -91,7 +92,7 @@ def blocking(func, timeout_seconds=10):
                 if req_id not in self.req_dict:
                     raise Exception(f'req_id [{req_id}] does not exist in request dictionary')
                 while self.req_dict[req_id]['req_status'] != 'DONE':
-                    time.sleep(1)
+                    time.sleep(0.1)
                 if req_id not in self.resp_dict:
                     raise Exception(f'req_id [{req_id}] does not exist in response dictionary')
                 data_result = self.resp_dict[req_id]
@@ -135,6 +136,14 @@ class ATIBApi(EWrapper, EClient):
         self.resp_dict = defaultdict(list)
         self.next_order_id = None
         self.order_dict = OrderedDict()
+        self.account_dict = dict()
+        self.account_history = OrderedDict()
+
+        self.account_summary = dict()
+        self.account_summary_history = []
+
+        self.position_list = []
+        self.position_history = []
 
     # helper functions
     def wait_till_connected(self, timeout_seconds=2):
@@ -152,11 +161,11 @@ class ATIBApi(EWrapper, EClient):
         super().nextValidId(order_id)
         self.next_order_id = order_id
 
-    def connect_local(self, port=7496, client_id=123):
+    def connect_local(self, port=7496, client_id=0):
         self.connect('127.0.0.1', port, client_id)
 
     def gen_req_id(self):
-        result_id = 1
+        result_id = 0
         if len(self.req_dict) > 0:
             result_id = np.max(list(self.req_dict.keys())) + 1
         return result_id
@@ -451,9 +460,6 @@ class ATIBApi(EWrapper, EClient):
         order_to_log = {camel_to_sneak(k): v for k, v in iter(input_order.__dict__.items())
                         if k in include_items}
         order_to_log['status'] = order_state.status
-        print('***')
-        print(order_to_log)
-
         self.order_dict[input_order.permId] = order_to_log
 
     def orderStatus(self, order_id: int, status: str, filled: float,
@@ -480,13 +486,198 @@ class ATIBApi(EWrapper, EClient):
     def req_global_cancel(self):
         self.reqGlobalCancel()
 
-    def req_open_orders(self):
-        print('req_open_orders')
-        self.reqOpenOrders()
+    def req_account_updates(self, subscribe: bool, acct_code: str):
+        req_id = self.gen_req_id()
+        self.reqAccountUpdates(subscribe, acct_code)
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def cancel_account_updates(self, acct_code: str):
+        self.req_account_updates(False, acct_code)
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_account_updates' and v['req_status'] in ['STARTED', 'DONE']:
+                self.req_dict[k]['req_status'] = 'CANCELLED'
+
+    def clean_account(self):
+        self.account_dict = dict()
+        self.account_history = OrderedDict()
+
+    def updateAccountValue(self, key: str, val: str, currency: str,
+                           account_name: str):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        self.account_dict['account_value'] = val_to_store
+
+    def updateAccountTime(self, time_stamp: str):
+        self.account_dict['account_time'] = time_stamp
+
+    def updatePortfolio(self,
+                        contract: Contract,
+                        position: float,
+                        market_price: float,
+                        market_value: float,
+                        average_cost: float,
+                        unrealized_pnl: float,
+                        realized_pnl: float,
+                        account_name: str):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        if 'positions' not in self.account_dict:
+            self.account_dict['positions'] = [val_to_store]
+        else:
+            self.account_dict['positions'].append(val_to_store)
+
+    def accountDownloadEnd(self, account_name: str):
+        super().accountDownloadEnd(account_name)
+        print(f'account download end [{account_name}]')
+        self.account_history[self.account_dict['account_time']] = self.account_dict
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_account_updates':
+                self.update_resp_obj(k, self.account_dict, True)
+        self.account_dict = dict()
+
+    def req_account_summary(self, group_name: str, tags: str):
+        req_id = self.gen_req_id()
+        self.reqAccountSummary(req_id, group_name, tags)
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def accountSummary(self, req_id: int, account: str, tag: str, value: str,
+                       currency: str):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        if req_id not in self.account_summary:
+            self.account_summary[req_id] = [val_to_store]
+        else:
+            self.account_summary[req_id].append(val_to_store)
+
+    def accountSummaryEnd(self, req_id: int):
+        acct_sum = self.account_summary[req_id]
+        self.account_summary_history.append(acct_sum)
+        self.update_resp_obj(req_id, acct_sum, True)
+        del self.account_summary[req_id]
+
+    def cancel_account_summary(self, req_id: int):
+        self.cancelAccountSummary(req_id)
+        self.req_dict[req_id]['req_status'] = 'CANCELLED'
+
+    def cancel_account_summary_all(self):
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_account_summary' and v['req_status'] in ['STARTED', 'DONE']:
+                self.cancel_account_summary(k)
+
+    def req_positions(self):
+        req_id = self.gen_req_id()
+        self.reqPositions()
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def position(self, account: str, contract: Contract, position: float,
+                 avg_cost: float):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        self.position_list.append(val_to_store)
+
+    def positionEnd(self):
+        self.position_history.append(self.position_list)
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_positions' and v['req_status'] == 'STARTED':
+                self.update_resp_obj(k, self.position_list, True)
+
+        self.position_list = []
+
+    def cancel_positions(self):
+        self.cancelPositions()
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_positions' and v['req_status'] in ['STARTED', 'DONE']:
+                self.req_dict[k]['req_status'] = 'CANCELLED'
+
+    def req_pnl_single(self, input_account: str, model_code: str, contract_id: int):
+        req_id = self.gen_req_id()
+        self.reqPnLSingle(req_id, input_account, model_code, contract_id)
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def pnlSingle(self, req_id: int, pos: int, daily_pnl: float, unrealized_pnl: float,
+                  realized_pnl: float, value: float):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self', 'req_id']}
+        val_to_store['pnl_timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, True)
+
+    def cancel_pnl_single(self, req_id):
+        self.cancelPnLSingle(req_id)
+        self.req_dict[req_id]['req_status'] = 'CANCELLED'
+
+    def req_pnl(self, account: str, model_code: str):
+        req_id = self.gen_req_id()
+        self.reqPnL(req_id, account, model_code)
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def pnl(self, req_id: int, daily_pnl: float, unrealized_pnl: float, realized_pnl: float):
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self', 'req_id']}
+        val_to_store['pnl_timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, True)
+
+    def cancel_pnl(self, req_id):
+        self.cancelPnL(req_id)
+        self.req_dict[req_id]['req_status'] = 'CANCELLED'
 
     # *
     # blocking requests!
     # *
+    # we convert some real time request to blocking for convenience
+    # account update
+    @blocking
+    def req_pnl_blocking(self, account: str, model_code: str):
+        req_id = self.req_pnl(account, model_code)
+        return req_id
+
+    @blocking
+    def req_pnl_single_blocking(self, input_account: str, model_code: str, contract_id: int):
+        req_id = self.req_pnl_single(input_account, model_code, contract_id)
+        return req_id
+
+    @blocking
+    def req_account_updates_blocking(self, acct_code):
+        req_id = self.req_account_updates(True, acct_code)
+        return req_id
+
+    # account summary
+    @blocking
+    def req_account_summary_blocking(self, group_name: str, tags: str):
+        req_id = self.req_account_summary(group_name, tags)
+        return req_id
+
+    # positions
+    @blocking
+    def req_positions_blocking(self):
+        req_id = self.req_positions()
+        return req_id
+
+    @blocking
+    def req_open_orders(self):
+        # this is a refresh of the open orders
+        self.clean_orders()
+        req_id = self.gen_req_id()
+        self.reqOpenOrders()
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def openOrderEnd(self):
+        super().openOrderEnd()
+        # change the status of the request to be done
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_open_orders' and v['req_status'] == 'STARTED':
+                self.update_resp_obj(k, self.order_dict, True)
+
+    @blocking
+    def req_managed_accts(self):
+        req_id = self.gen_req_id()
+        self.reqManagedAccts()
+        self.log_req(req_id, current_fn_name(), vars())
+        return req_id
+
+    def managedAccounts(self, accounts_list: str):
+        for k, v in iter(self.req_dict.items()):
+            if v['func_name'] == 'req_managed_accts' and v['req_status'] == 'STARTED':
+                self.update_resp_obj(k, accounts_list, True)
 
     @blocking
     def req_contract_details(self, contract: Contract):
@@ -597,7 +788,8 @@ class ATIBApi(EWrapper, EClient):
 
 if __name__ == '__main__':
     app = ATIBApi()
-    app.connect_local(port=7497)
+    # app.connect_local(port=7497)
+    app.connect_local()
     api_thread = threading.Thread(target=app.run, daemon=True)
     api_thread.start()
     app.wait_till_connected()
@@ -613,8 +805,9 @@ if __name__ == '__main__':
     # app.req_tick_by_tick_data(asset, TickType.mid)
     # app.req_mkt_depth(asset, 10, True, [])
     # app.req_real_time_bars(asset, 1, 'TRADES', True, [])
-
+    # app.req_account_updates(True, 'DU1589832')
     # result = app.req_historical_data_non_blocking(asset, "1 D", '1 min', 'MIDPOINT', 1, 1, [])
+    # app.req_account_summary('All', AccountSummaryTags.AllTags)
 
     # blocking
     # result = app.req_contract_details(asset)
@@ -626,18 +819,25 @@ if __name__ == '__main__':
     # result2 = app.req_head_time_stamp(asset, 'TRADES', 0, 1)
 
     # orders: be very careful of this
-    order = Order()
-    order.action = 'BUY'
-    order.orderType = 'LMT'
-    order.totalQuantity = 100
-    order.lmtPrice = 80
+    # order = Order()
+    # order.action = 'BUY'
+    # order.orderType = 'LMT'
+    # order.totalQuantity = 100
+    # order.lmtPrice = 80
+    #
+    # # app.clean_orders()
+    # result = app.req_open_orders()
+    # # app.place_order(asset, order)
+    #
+    # # app.req_global_cancel()
+    # result2 = app.req_managed_accts()
+    # account = app.req_account_updates_blocking('DU1589832')
+    # account_summary = app.req_account_summary_blocking('All', AccountSummaryTags.AllTags)
+    # positions = app.req_positions_blocking()
 
-    # app.clean_orders()
-    # app.req_open_orders()
-    app.place_order(asset, order)
-
-    # app.req_global_cancel()
-
-    time.sleep(10)
+    # app.req_pnl_single('U1069514', '', 388013150)
+    # pnl_result = app.req_pnl_single_blocking('U1069514', '', 388013150)
+    app.req_pnl('U1069514', '')
+    time.sleep(5)
     # app.cancel_mkt_data_all()
     app.disconnect()
