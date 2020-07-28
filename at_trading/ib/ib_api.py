@@ -1,10 +1,11 @@
+import json
 import time
 import datetime
 from collections import OrderedDict, defaultdict
 import signal  # doesn't work on windows
 from typing import List, Dict
 from functools import reduce
-
+import pandas as pd
 from ibapi.account_summary_tags import AccountSummaryTags
 from ibapi.client import EClient, SmartComponentMap, TickAttribLast, TickAttribBidAsk, \
     BarData, HistogramData
@@ -18,9 +19,34 @@ import numpy as np
 import logging
 import enum
 
+from at_trading.gcp.gcp_pubsub import gcp_pubsub_publish
+from at_trading.util.util_data_structure import flatten_dictionary
+from at_trading.util.util_types import is_primitive
+
 # *
 # constants
 # *
+INSTRUMENT_FUTURES_ATTR = [
+    'contract.conId',
+    'contract.symbol',
+    'contract.secType',
+    'contract.lastTradeDateOrContractMonth',
+    'contract.multiplier',
+    'contract.exchange',
+    'contract.currency',
+    'contract.localSymbol',
+    'marketName',
+    'contractMonth',
+    'minTick',
+    'priceMagnifier',
+    'underConId',
+    'longName',
+    'category',
+    'underSymbol',
+    'underSecType',
+    'realExpirationDate'
+]
+
 REAL_TIME_BAR_TYPES = ['TRADES',
                        'BID',
                        'ASK',
@@ -45,11 +71,17 @@ class MarketDataType(enum.Enum):
 # *
 # contracts/i.e. Assets/Securities
 # *
+def gen_contract_id_only(contract_id):
+    result_contract = Contract()
+    result_contract.conId = contract_id
+    return result_contract
 
-def gen_contract(symbol, sec_type, exchange, currency):
+
+def gen_contract(symbol, sec_type, exchange, currency, other_param_dict: Dict = None):
     """
     shortcut for creating a contract
 
+    :param other_param_dict:
     :param symbol:
     :param sec_type:
     :param exchange:
@@ -61,6 +93,13 @@ def gen_contract(symbol, sec_type, exchange, currency):
     result_contract.secType = sec_type
     result_contract.exchange = exchange
     result_contract.currency = currency
+    if other_param_dict is None:
+        param_dict = {}
+    else:
+        param_dict = other_param_dict
+
+    for k, v in iter(param_dict.items()):
+        setattr(result_contract, k, v)
     return result_contract
 
 
@@ -80,27 +119,63 @@ class timeout:
         signal.alarm(0)
 
 
-def blocking(func, timeout_seconds=3):
-    def _blocking_decorator(self, *args, **kwargs):
-        logger = logging.getLogger(__name__)
-        data_result = None
-        try:
-            with timeout(timeout_seconds):
-                req_id = func(self, *args, **kwargs)
-                if req_id is None:
-                    raise Exception(f'req_id is not returned')
-                if req_id not in self.req_dict:
-                    raise Exception(f'req_id [{req_id}] does not exist in request dictionary')
-                while self.req_dict[req_id]['req_status'] != 'DONE':
-                    time.sleep(0.1)
-                if req_id not in self.resp_dict:
-                    raise Exception(f'req_id [{req_id}] does not exist in response dictionary')
-                data_result = self.resp_dict[req_id]
-        except Exception as e:
-            logger.error(e)
-        return data_result
+def recursive_obj_to_dict(input_obj):
+    if input_obj is None or is_primitive(input_obj):
+        return input_obj
+    elif isinstance(input_obj, list):
+        return [recursive_obj_to_dict(x) for x in input_obj]
+    elif isinstance(input_obj, dict):
+        return {k: recursive_obj_to_dict(v) for k, v in iter(input_obj.items())}
+    else:
+        return {k: recursive_obj_to_dict(v) for k, v in iter(input_obj.__dict__.items())}
 
-    return _blocking_decorator
+
+def update_resp_obj_auto(exception_list, update_status, **kwargs):
+    assert 'self' in kwargs.keys(), 'self must be provided[i.e. call from an object]'
+    assert 'req_id' in kwargs.keys(), 'req_id must be provided'
+    obj = kwargs['self']
+    val_to_store = {k: v for k, v in iter(kwargs.items()) if k not in exception_list}
+    val_to_store['timestamp'] = datetime.datetime.now()
+    if 'tick_type' in kwargs.keys() and 'tick_type' not in exception_list:
+        val_to_store['tick_type'] = TickTypeEnum.idx2name[kwargs['tick_type']]
+    obj.update_resp_obj(kwargs['req_id'], val_to_store, False)
+    return val_to_store
+
+class BlockingArgs(object):
+    def __init__(self, timeout_seconds=2, format_type='raw'):
+        self.timeout_seconds = timeout_seconds
+        self.format_type = format_type
+
+    def __call__(self, func):
+        def wrapped_f(input_obj, *args, **kwargs):
+            logger = logging.getLogger(__name__)
+            data_result = None
+            try:
+                with timeout(self.timeout_seconds):
+                    req_id = func(input_obj, *args, **kwargs)
+                    if req_id is None:
+                        raise Exception(f'req_id is not returned')
+                    if req_id not in input_obj.req_dict:
+                        raise Exception(f'req_id [{req_id}] does not exist in request dictionary')
+                    while input_obj.req_dict[req_id]['req_status'] != 'DONE':
+                        time.sleep(0.1)
+                    if req_id not in input_obj.resp_dict:
+                        raise Exception(f'req_id [{req_id}] does not exist in response dictionary')
+                    data_result = input_obj.resp_dict[req_id]
+            except Exception as e:
+                logger.error(e)
+
+            if data_result is not None:
+                if self.format_type == 'df':
+                    data_result = pd.DataFrame(data_result)
+                elif self.format_type == 'dict':
+                    data_result = [recursive_obj_to_dict(x) for x in data_result]
+                elif self.format_type == 'list_df_combine':
+                    data_result = pd.concat([pd.DataFrame(x) for x in data_result], ignore_index=True)
+
+            return data_result
+
+        return wrapped_f
 
 
 def camel_to_sneak(input_str):
@@ -113,7 +188,7 @@ def camel_to_sneak(input_str):
 # TODO: overwrite these behaviour
 
 class ATIBApi(EWrapper, EClient):
-    def __init__(self, log_blocking_req: bool = False, env_type='live'):
+    def __init__(self, log_blocking_req: bool = False, env_type='live', upload_to_cloud=True):
         """
         usage:
         >>> app = ATIBApi()
@@ -126,6 +201,7 @@ class ATIBApi(EWrapper, EClient):
         """
         EClient.__init__(self, self)
         self.env_type = env_type
+        self.upload_to_cloud = upload_to_cloud
         # there are two types of request, blocking vs non-blocking
         # if this flag is turned off, then only log non-blocking requests
         self.log_blocking_req = log_blocking_req
@@ -235,12 +311,24 @@ class ATIBApi(EWrapper, EClient):
 
     # reqMktData: response functions
     def tickPrice(self, req_id, tick_type, price, attrib):
-        print(f'{req_id}|{TickTypeEnum.idx2name[tick_type]}|{price}|{attrib}')
+        logger = logging.getLogger(__name__)
+        update_resp_obj_auto(['self', 'req_id'], False, **vars())
+        if self.upload_to_cloud:
+            if TickTypeEnum.idx2name[tick_type] == 'LAST':
+                logger.info('uploading to pubsub')
+                message = json.dumps({
+                    'ticker': self.req_dict[0]['func_param']['contract'].symbol,
+                    'tick_type': TickTypeEnum.idx2name[tick_type],
+                    'value': price
+                })
+                gcp_pubsub_publish('ib_prices', message, message_param_dict=None, project_id=None)
 
     def tickSize(self, req_id: int, tick_type: int, size: int):
+        update_resp_obj_auto(['self', 'req_id'], False, **vars())
         print(f'{req_id}|{TickTypeEnum.idx2name[tick_type]}|{size}')
 
     def tickString(self, req_id, tick_type: int, value: str):
+        update_resp_obj_auto(['self', 'req_id'], False, **vars())
         print(f'{req_id}|{TickTypeEnum.idx2name[tick_type]}|{value}')
 
     def tickSnapshotEnd(self, req_id: int):
@@ -273,13 +361,22 @@ class ATIBApi(EWrapper, EClient):
                           size: int, tick_attrib_last: TickAttribLast, exchange: str,
                           special_conditions: str):
         print(f'{req_id}|{tick_type}|{in_time}|{price}|{size}|{tick_attrib_last}|{exchange}|{special_conditions}')
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self', 'req_id']}
+        val_to_store['timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, False)
 
     def tickByTickBidAsk(self, req_id: int, in_time: int, bid_price: float, ask_price: float,
                          bid_size: int, ask_size: int, tick_attrib_bid_ask: TickAttribBidAsk):
         print(f'{req_id}|{in_time}|{bid_price}|{ask_price}|{bid_size}|{ask_size}|{tick_attrib_bid_ask}')
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self', 'req_id']}
+        val_to_store['timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, False)
 
     def tickByTickMidPoint(self, req_id: int, in_time: int, mid_point: float):
         print(f'{req_id}|{in_time}|{mid_point}')
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self', 'req_id']}
+        val_to_store['timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, False)
 
     def cancel_tick_by_tick_data(self, req_id: int):
         print(f'request {req_id} is cancelled')
@@ -339,18 +436,21 @@ class ATIBApi(EWrapper, EClient):
             if v['func_name'] == 'req_mkt_depth' and v['req_status'] == 'STARTED':
                 self.cancel_mkt_depth(k)
 
-    def req_real_time_bars(self, contract: Contract, bar_size: int,
+    def req_real_time_bars(self, input_contract: Contract, bar_size: int,
                            what_to_show: str, use_rth: bool,
                            real_time_bars_options: List):
         req_id = self.gen_req_id()
         assert what_to_show in REAL_TIME_BAR_TYPES, f'what_to_show {what_to_show} is not supported'
-        self.reqRealTimeBars(req_id, contract, bar_size, what_to_show, use_rth, real_time_bars_options)
+        self.reqRealTimeBars(req_id, input_contract, bar_size, what_to_show, use_rth, real_time_bars_options)
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
 
     def realtimeBar(self, req_id: int, in_time: int, open_px: float, high_px: float, low_px: float, close_px: float,
                     volume: int, wap: float, count: int):
         print(f'{req_id}|{in_time}|{open_px}|{high_px}|{low_px}|{close_px}|{volume}|{wap}|{count}')
+        val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        val_to_store['realtime_bar_timestamp'] = datetime.datetime.now()
+        self.update_resp_obj(req_id, val_to_store, False)
 
     def cancel_real_time_bars(self, req_id):
         print(f'request {req_id} is cancelled')
@@ -375,12 +475,12 @@ class ATIBApi(EWrapper, EClient):
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
 
-    @blocking
-    def req_historical_data_blocking(self, contract: Contract, end_date_time: str,
+    @BlockingArgs()
+    def req_historical_data_blocking(self, input_contract: Contract, end_date_time: str,
                                      duration_str: str, bar_size_setting: str, what_to_show: str,
                                      use_rth: int, format_date: int, chart_options: List):
         req_id = self.gen_req_id()
-        self.reqHistoricalData(req_id, contract, end_date_time, duration_str, bar_size_setting, what_to_show,
+        self.reqHistoricalData(req_id, input_contract, end_date_time, duration_str, bar_size_setting, what_to_show,
                                use_rth, format_date, False, chart_options)
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
@@ -391,6 +491,9 @@ class ATIBApi(EWrapper, EClient):
         else:
             self.resp_dict[req_id].append(bar)
         print(f'{req_id}|{bar}')
+        # val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
+        # val_to_store['realtime_bar_timestamp'] = datetime.datetime.now()
+        # self.update_resp_obj(req_id, val_to_store, True)
 
     def historicalDataUpdate(self, req_id: int, bar: BarData):
         print(f'{req_id}|{bar}')
@@ -624,34 +727,34 @@ class ATIBApi(EWrapper, EClient):
     # *
     # we convert some real time request to blocking for convenience
     # account update
-    @blocking
+    @BlockingArgs(timeout_seconds=1, format_type='df')
     def req_pnl_blocking(self, account: str, model_code: str):
         req_id = self.req_pnl(account, model_code)
         return req_id
 
-    @blocking
+    @BlockingArgs(format_type='df')
     def req_pnl_single_blocking(self, input_account: str, model_code: str, contract_id: int):
         req_id = self.req_pnl_single(input_account, model_code, contract_id)
         return req_id
 
-    @blocking
+    @BlockingArgs(format_type='dict')
     def req_account_updates_blocking(self, acct_code):
         req_id = self.req_account_updates(True, acct_code)
         return req_id
 
     # account summary
-    @blocking
+    @BlockingArgs(timeout_seconds=1, format_type='list_df_combine')
     def req_account_summary_blocking(self, group_name: str, tags: str):
         req_id = self.req_account_summary(group_name, tags)
         return req_id
 
     # positions
-    @blocking
+    @BlockingArgs()
     def req_positions_blocking(self):
         req_id = self.req_positions()
         return req_id
 
-    @blocking
+    @BlockingArgs()
     def req_open_orders(self):
         # this is a refresh of the open orders
         self.clean_orders()
@@ -667,7 +770,7 @@ class ATIBApi(EWrapper, EClient):
             if v['func_name'] == 'req_open_orders' and v['req_status'] == 'STARTED':
                 self.update_resp_obj(k, self.order_dict, True)
 
-    @blocking
+    @BlockingArgs()
     def req_managed_accts(self):
         req_id = self.gen_req_id()
         self.reqManagedAccts()
@@ -679,10 +782,34 @@ class ATIBApi(EWrapper, EClient):
             if v['func_name'] == 'req_managed_accts' and v['req_status'] == 'STARTED':
                 self.update_resp_obj(k, accounts_list, True)
 
-    @blocking
-    def req_contract_details(self, contract: Contract):
+    # instrument specific logics
+
+    def req_contract_details_futures(self, symbol, sec_type='FUT',
+                                     exchange='GLOBEX', summary_only=True):
+        """
+
+        :param symbol:
+        :param sec_type:
+        :param exchange:
+        :param summary_only:
+        :return:
+        """
+        assert sec_type in ['FUT', 'CONTFUT', 'FUT+CONTFUT'], 'sec_type [{}] not supported'.format(sec_type)
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = sec_type
+        contract.exchange = exchange
+        result_contract = self.req_contract_details(contract)
+        print(result_contract)
+        # format the future contract details
+        if summary_only:
+            result_contract = [flatten_dictionary(x, INSTRUMENT_FUTURES_ATTR) for x in result_contract]
+        return result_contract
+
+    @BlockingArgs(format_type='dict')
+    def req_contract_details(self, input_contract: Contract):
         req_id = self.gen_req_id()
-        self.reqContractDetails(req_id, contract)
+        self.reqContractDetails(req_id, input_contract)
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
 
@@ -693,8 +820,8 @@ class ATIBApi(EWrapper, EClient):
         self.req_dict[req_id]['req_status'] = 'DONE'
         print(f'{req_id} contract detail done')
 
-    @blocking
-    def req_matching_symbols(self, pattern):
+    @BlockingArgs()
+    def req_matching_symbols(self, pattern: str) -> int:
         req_id = self.gen_req_id()
         self.reqMatchingSymbols(req_id, pattern)
         self.log_req(req_id, current_fn_name(), vars())
@@ -704,9 +831,11 @@ class ATIBApi(EWrapper, EClient):
                       contract_description: List):
         print(f'{req_id}|{contract_description}')
         # for functions that don't have 'End' callback, log here
+        for desc in contract_description:
+            print(desc)
         self.update_resp_list(req_id, contract_description, True)
 
-    @blocking
+    @BlockingArgs()
     def req_smart_components(self, exchange_char):
         """
             The tick types 'bidExch' (tick type 32), 'askExch' (tick type 33), 'lastExch' (tick type 84)
@@ -722,7 +851,7 @@ class ATIBApi(EWrapper, EClient):
     def smartComponents(self, req_id: int, smart_component_map: SmartComponentMap):
         self.update_resp_obj(req_id, smart_component_map, True)
 
-    @blocking
+    @BlockingArgs()
     def req_mkt_depth_exchanges(self):
         req_id = self.gen_req_id()
         self.reqMktDepthExchanges()
@@ -743,7 +872,7 @@ class ATIBApi(EWrapper, EClient):
             else:
                 self.resp_dict[req_id].extend(depth_mkt_data_descriptions)
 
-    @blocking
+    @BlockingArgs()
     def req_historical_ticks(self, contract: Contract, start_date_time: str,
                              end_date_time: str, number_of_ticks: int, what_to_show: str, use_rth: int,
                              ignore_size: bool, misc_options: List):
@@ -762,11 +891,11 @@ class ATIBApi(EWrapper, EClient):
     def historicalTicksLast(self, req_id: int, ticks: List, done: bool):
         self.update_resp_list(req_id, ticks, done)
 
-    @blocking
-    def req_head_time_stamp(self, contract: Contract,
+    @BlockingArgs()
+    def req_head_time_stamp(self, input_contract: Contract,
                             what_to_show: str, use_rth: int, format_date: int):
         req_id = self.gen_req_id()
-        self.reqHeadTimeStamp(req_id, contract,
+        self.reqHeadTimeStamp(req_id, input_contract,
                               what_to_show, use_rth, format_date)
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
@@ -793,25 +922,41 @@ if __name__ == '__main__':
     api_thread = threading.Thread(target=app.run, daemon=True)
     api_thread.start()
     app.wait_till_connected()
+
+    # contract = Contract()
+    # contract.symbol = "EUR"
+    # contract.secType = "CASH"
+    # contract.currency = "USD"
+    # contract.exchange = "IDEALPRO"
+
     asset = Contract()
     asset.symbol = 'IBM'
     asset.secType = 'STK'
     asset.exchange = 'SMART'
     asset.currency = 'USD'
 
-    # non blocking
-    # app.req_mkt_data(asset, snapshot=False)
+    # id only asset
+    # asset = Contract()
+    # asset.conId = '388013150'
 
-    # app.req_tick_by_tick_data(asset, TickType.mid)
+    # asset = gen_contract(
+    #     'SPX', 'IND', 'CBOE', 'USD')
+
+    # non blocking
+    app.req_mkt_data(asset, snapshot=False)
+
+    # app.req_tick_by_tick_data(contract, TickType.mid)
     # app.req_mkt_depth(asset, 10, True, [])
     # app.req_real_time_bars(asset, 1, 'TRADES', True, [])
     # app.req_account_updates(True, 'DU1589832')
-    # result = app.req_historical_data_non_blocking(asset, "1 D", '1 min', 'MIDPOINT', 1, 1, [])
+    # result = app.req_historical_data_non_blocking(contract, "1 D", '1 min', 'MIDPOINT', 1, 1, [])
     # app.req_account_summary('All', AccountSummaryTags.AllTags)
 
     # blocking
     # result = app.req_contract_details(asset)
-    # result = app.req_matching_symbols('IBM')
+    # result = app.req_matching_symbols('VIX')
+    # result = app.req_contract_details_futures('VIX', exchange='CFE',
+    #                                           summary_only=True)
     # result = app.req_mkt_depth_exchanges()
     # queryTime = (datetime.datetime.today() - datetime.timedelta(days=180)).strftime("%Y%m%d %H:%M:%S")
     # result = app.req_historical_data_blocking(asset, queryTime, "1 M", '1 day', 'MIDPOINT', 1, 1, [])
@@ -824,10 +969,10 @@ if __name__ == '__main__':
     # order.orderType = 'LMT'
     # order.totalQuantity = 100
     # order.lmtPrice = 80
-    #
-    # # app.clean_orders()
-    # result = app.req_open_orders()
-    # # app.place_order(asset, order)
+    # #
+    # # # app.clean_orders()
+    # # result = app.req_open_orders()
+    # app.place_order(asset, order)
     #
     # # app.req_global_cancel()
     # result2 = app.req_managed_accts()
@@ -835,9 +980,10 @@ if __name__ == '__main__':
     # account_summary = app.req_account_summary_blocking('All', AccountSummaryTags.AllTags)
     # positions = app.req_positions_blocking()
 
-    # app.req_pnl_single('U1069514', '', 388013150)
+    # result = app.req_pnl_blocking('U1069514', '')
+    # result = app.req_pnl_single()
     # pnl_result = app.req_pnl_single_blocking('U1069514', '', 388013150)
-    app.req_pnl('U1069514', '')
-    time.sleep(5)
+    # app.req_pnl('U1069514', '')
+    time.sleep(60)
     # app.cancel_mkt_data_all()
     app.disconnect()
