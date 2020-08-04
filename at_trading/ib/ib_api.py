@@ -141,6 +141,7 @@ def update_resp_obj_auto(exception_list, update_status, **kwargs):
     obj.update_resp_obj(kwargs['req_id'], val_to_store, False)
     return val_to_store
 
+
 class BlockingArgs(object):
     def __init__(self, timeout_seconds=2, format_type='raw'):
         self.timeout_seconds = timeout_seconds
@@ -475,7 +476,7 @@ class ATIBApi(EWrapper, EClient):
         self.log_req(req_id, current_fn_name(), vars())
         return req_id
 
-    @BlockingArgs()
+    @BlockingArgs(timeout_seconds=60)
     def req_historical_data_blocking(self, input_contract: Contract, end_date_time: str,
                                      duration_str: str, bar_size_setting: str, what_to_show: str,
                                      use_rth: int, format_date: int, chart_options: List):
@@ -486,14 +487,9 @@ class ATIBApi(EWrapper, EClient):
         return req_id
 
     def historicalData(self, req_id: int, bar: BarData):
-        if req_id not in self.resp_dict:
-            self.resp_dict[req_id] = [bar]
-        else:
-            self.resp_dict[req_id].append(bar)
-        print(f'{req_id}|{bar}')
-        # val_to_store = {k: v for k, v in iter(vars().items()) if k not in ['self']}
-        # val_to_store['realtime_bar_timestamp'] = datetime.datetime.now()
-        # self.update_resp_obj(req_id, val_to_store, True)
+        # parse the bardata
+        val_to_store = bar.__dict__
+        self.update_resp_obj(req_id, val_to_store, False)
 
     def historicalDataUpdate(self, req_id: int, bar: BarData):
         print(f'{req_id}|{bar}')
@@ -929,21 +925,30 @@ if __name__ == '__main__':
     # contract.currency = "USD"
     # contract.exchange = "IDEALPRO"
 
-    asset = Contract()
-    asset.symbol = 'IBM'
-    asset.secType = 'STK'
-    asset.exchange = 'SMART'
-    asset.currency = 'USD'
+    # asset = Contract()
+    # asset.symbol = 'IBM'
+    # asset.secType = 'STK'
+    # asset.exchange = 'SMART'
+    # asset.currency = 'USD'
 
     # id only asset
-    # asset = Contract()
-    # asset.conId = '388013150'
+    # vix_contract = app.req_contract_details_futures('VIX', exchange='CFE',
+    #                                  summary_only=True)
+
+    asset = Contract()
+    asset.symbol = 'VIX'
+    asset.secType = 'FUT'
+    asset.currency = 'USD'
+    asset.exchange = 'CFE'
+    asset.localSymbol = 'VXQ0'
+    asset.multiplier = '1000'
+    asset.lastTradeDateOrContractMonth = '20200819'
 
     # asset = gen_contract(
     #     'SPX', 'IND', 'CBOE', 'USD')
 
     # non blocking
-    app.req_mkt_data(asset, snapshot=False)
+    # app.req_mkt_data(asset, snapshot=False)
 
     # app.req_tick_by_tick_data(contract, TickType.mid)
     # app.req_mkt_depth(asset, 10, True, [])
@@ -958,8 +963,9 @@ if __name__ == '__main__':
     # result = app.req_contract_details_futures('VIX', exchange='CFE',
     #                                           summary_only=True)
     # result = app.req_mkt_depth_exchanges()
-    # queryTime = (datetime.datetime.today() - datetime.timedelta(days=180)).strftime("%Y%m%d %H:%M:%S")
-    # result = app.req_historical_data_blocking(asset, queryTime, "1 M", '1 day', 'MIDPOINT', 1, 1, [])
+    # queryTime = (datetime.datetime.today() - datetime.timedelta(days=10)).strftime("%Y%m%d %H:%M:%S")
+    queryTime = datetime.datetime.today().strftime("%Y%m%d") + " 16:00:00"
+    result = app.req_historical_data_blocking(asset, queryTime, "1 D", '5 secs', 'TRADES', 1, 1, [])
     # result = app.req_historical_ticks(asset, "20200622 10:39:33", '', 100, 'TRADES', 1, True, [])
     # result2 = app.req_head_time_stamp(asset, 'TRADES', 0, 1)
 
@@ -984,6 +990,6 @@ if __name__ == '__main__':
     # result = app.req_pnl_single()
     # pnl_result = app.req_pnl_single_blocking('U1069514', '', 388013150)
     # app.req_pnl('U1069514', '')
-    time.sleep(60)
+    time.sleep(10)
     # app.cancel_mkt_data_all()
     app.disconnect()
