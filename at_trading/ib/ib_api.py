@@ -940,15 +940,15 @@ if __name__ == '__main__':
     asset.secType = 'FUT'
     asset.currency = 'USD'
     asset.exchange = 'CFE'
-    asset.localSymbol = 'VXQ0'
+    asset.localSymbol = 'VXU0'
     asset.multiplier = '1000'
-    asset.lastTradeDateOrContractMonth = '20200819'
+    asset.lastTradeDateOrContractMonth = '20200916'
 
     # asset = gen_contract(
     #     'SPX', 'IND', 'CBOE', 'USD')
 
     # non blocking
-    # app.req_mkt_data(asset, snapshot=False)
+    app.req_mkt_data(asset, snapshot=False)
 
     # app.req_tick_by_tick_data(contract, TickType.mid)
     # app.req_mkt_depth(asset, 10, True, [])
@@ -964,8 +964,8 @@ if __name__ == '__main__':
     #                                           summary_only=True)
     # result = app.req_mkt_depth_exchanges()
     # queryTime = (datetime.datetime.today() - datetime.timedelta(days=10)).strftime("%Y%m%d %H:%M:%S")
-    queryTime = datetime.datetime.today().strftime("%Y%m%d") + " 16:00:00"
-    result = app.req_historical_data_blocking(asset, queryTime, "1 D", '5 secs', 'TRADES', 1, 1, [])
+    # queryTime = datetime.datetime.today().strftime("%Y%m%d") + " 16:00:00"
+    # result = app.req_historical_data_blocking(asset, queryTime, "1 D", '5 secs', 'TRADES', 1, 1, [])
     # result = app.req_historical_ticks(asset, "20200622 10:39:33", '', 100, 'TRADES', 1, True, [])
     # result2 = app.req_head_time_stamp(asset, 'TRADES', 0, 1)
 
@@ -990,6 +990,6 @@ if __name__ == '__main__':
     # result = app.req_pnl_single()
     # pnl_result = app.req_pnl_single_blocking('U1069514', '', 388013150)
     # app.req_pnl('U1069514', '')
-    time.sleep(10)
+    time.sleep(20)
     # app.cancel_mkt_data_all()
     app.disconnect()

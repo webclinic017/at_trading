@@ -19,6 +19,9 @@ import apache_beam.transforms.window as window
 
 
 class ExposeMsgTimestamp(beam.DoFn):
+    def to_runner_api_parameter(self, unused_context):
+        pass
+
     def process(self, element):
         item = element.decode("utf-8")
         item_json = json.loads(item)
@@ -29,6 +32,9 @@ class ExposeMsgTimestamp(beam.DoFn):
 
 
 class AggregateData(beam.DoFn):
+    def to_runner_api_parameter(self, unused_context):
+        pass
+
     def process(self, element):
         msg_body_list = [json.loads(x['message_body']) for x in element]
         agg_df = pd.DataFrame(msg_body_list)
@@ -48,6 +54,7 @@ class AggregateData(beam.DoFn):
 
 class GroupWindowsIntoBatches(beam.PTransform):
     def __init__(self, window_size):
+        super().__init__()
         self.window_size = int(window_size)
 
     def expand(self, input_or_inputs):
@@ -68,7 +75,8 @@ class WriteToBucket(beam.DoFn):
     def to_runner_api_parameter(self, unused_context):
         pass
 
-    def __init__(self, bucket_path):
+    def __init__(self, bucket_path, *unused_args, **unused_kwargs):
+        super().__init__(*unused_args, **unused_kwargs)
         self.output_path = bucket_path
 
     def process(self, element, window_param=beam.DoFn.WindowParam):

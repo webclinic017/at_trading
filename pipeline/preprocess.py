@@ -1,9 +1,13 @@
 import argparse
+import pyarrow as pa
+from os import path
 from apache_beam.options.pipeline_options import PipelineOptions
 import re
 from google.cloud import bigquery
 import logging
 import pandas as pd
+from pyarrow.parquet import write_table
+
 from at_trading.gcp.config import GCP_PROJECT_ID
 from past.builtins import unicode
 
@@ -46,9 +50,54 @@ def populate_table_from_parquet(bucket_name='at-ml-bucket', storage_path='prices
     logger.info("Loaded {} rows.".format(destination_table.num_rows))
 
 
-def run_preprocess_pipeline_batch(bucket_full_path, pipeline_options, save_main_session=True):
+class ComputeReturn(beam.DoFn):
+    def to_runner_api_parameter(self, unused_context):
+        pass
+
+    def process(self, element):
+        assert isinstance(element, pd.DataFrame), \
+            'element is of type [{}], only dataframe is supported'.format(
+                type(element))
+
+        sorted_element = element.sort_values('date_time')
+        sorted_element['period_return'] = sorted_element['close'].pct_change()
+        return_element = sorted_element[['date_time', 'ticker', 'period_return']].dropna()
+        return_element = return_element.set_index('date_time')
+        yield return_element
+
+
+def combine_all_dataframe(dataframe_list):
+    feature_df = None
+    if dataframe_list:
+        feature_df = pd.concat(dataframe_list)
+    return feature_df
+
+
+class WriteToBucket(beam.DoFn):
+
+    def to_runner_api_parameter(self, unused_context):
+        pass
+
+    def __init__(self, bucket_path, *unused_args, **unused_kwargs):
+        super().__init__(*unused_args, **unused_kwargs)
+        self.output_path = bucket_path
+
+    def process(self, element):
+        full_path = path.join(self.output_path, 'test.parquet')
+        element.pivot(columns='ticker', values='period_return').dropna().to_parquet(full_path)
+
+
+def run_preprocess_pipeline_batch(bucket_full_path,
+                                  output_path,
+                                  pipeline_options,
+                                  start_date,
+                                  end_date,
+                                  save_main_session=True):
     """
 
+    :param output_path:
+    :param end_date:
+    :param start_date:
     :param bucket_full_path:
     :param pipeline_options:
     :param save_main_session:
@@ -56,35 +105,18 @@ def run_preprocess_pipeline_batch(bucket_full_path, pipeline_options, save_main_
     """
     pipeline_options = PipelineOptions(pipeline_options)
     pipeline_options.view_as(SetupOptions).save_main_session = save_main_session
+    pipeline = beam.Pipeline(options=pipeline_options)
 
-    with beam.Pipeline(options=pipeline_options) as p:
-        dataframes = p \
-                     | 'Read' >> ReadFromParquetBatched(bucket_full_path)\
-                     | 'Convert to pandas' >> beam.Map(lambda table: table.to_pandas())
-        result = p.run()
-        result.wait_until_finish()
-        print(result)
+    dataframes = (pipeline
+                  | 'Read' >> ReadFromParquetBatched(bucket_full_path)
+                  | 'Convert to pandas' >> beam.Map(lambda table: table.to_pandas())
+                  | 'calculate return' >> beam.ParDo(ComputeReturn())
+                  | 'combine into feature dataframe' >> beam.CombineGlobally(combine_all_dataframe)
+                  | 'write the result to bucket' >> beam.ParDo(WriteToBucket(output_path))
+                  )
 
-        #
-        # # Count the occurrences of each word.
-        # counts = (
-        #     lines
-        #     | 'Split' >> (
-        #         beam.FlatMap(lambda x: re.findall(r'[A-Za-z\']+', x)).
-        #             with_output_types(unicode))
-        #     | 'PairWithOne' >> beam.Map(lambda x: (x, 1))
-        #     | 'GroupAndSum' >> beam.CombinePerKey(sum))
-        #
-        # # Format the counts into a PCollection of strings.
-        # def format_result(word_count):
-        #     (word, count) = word_count
-        #     return '%s: %s' % (word, count)
-        #
-        # output = counts | 'Format' >> beam.Map(format_result)
-        #
-        # # Write the output using a "Write" transform that has side effects.
-        # # pylint: disable=expression-not-assigned
-        # output | WriteToText(known_args.output)
+    result = pipeline.run()
+    result.wait_until_finish()
 
 
 def run(argv=None, save_main_session=True):
@@ -99,11 +131,10 @@ def run(argv=None, save_main_session=True):
     parser.add_argument(
         '--output',
         dest='output',
-        # CHANGE 1/6: The Google Cloud Storage path is required
-        # for outputting the results.
         default='gs://at-ml-bucket/beam/output',
         help='Output file to write results to.')
     known_args, pipeline_args = parser.parse_known_args(argv)
+
     pipeline_args.extend([
         # DataflowRunner or DirectRunner
         '--runner=DirectRunner',
@@ -113,7 +144,7 @@ def run(argv=None, save_main_session=True):
         '--temp_location=gs://at-ml-bucket/beam/temp',
         '--job_name=your-wordcount-job',
     ])
-    run_preprocess_pipeline_batch(known_args.input, pipeline_args, True)
+    run_preprocess_pipeline_batch(known_args.input, known_args.output, pipeline_args, None, None, True)
 
 
 if __name__ == '__main__':

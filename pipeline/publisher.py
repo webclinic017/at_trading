@@ -33,7 +33,7 @@ def publish_message_from_storage(bucket_path,
     usage:
     >>> bucket_path = 'gs://at-ml-bucket/prices/*.parquet'
     >>> topic_id = 'ib_stream'
-    >>> create_topic = True
+    >>> create_topic = False
     >>> project_id = None
 
 
