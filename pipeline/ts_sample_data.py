@@ -1,6 +1,69 @@
 import pandas as pd
 from pandas import Timestamp
 import datetime
+import numpy as np
+
+
+def make_sample_data_random_ts(n_rows,
+                               n_columns,
+                               random_seed=None,
+                               column_labels=None,
+                               use_date_index=True,
+                               start_date=None,
+                               end_date=None):
+    """
+
+    :param random_seed:
+    :param column_labels:
+    :param use_date_index:
+    :param n_rows:
+    :param n_columns:
+    :param start_date:
+    :param end_date:
+    usage:
+        >>> start_date = datetime.date(2010, 1, 1)
+        >>> end_date = datetime.date(2020, 1, 3)
+        no start nor end date
+        >>> make_sample_data_random_ts(100, 3)
+
+        with start date only
+        >>> make_sample_data_random_ts(100, 3, start_date=start_date)
+
+        with end date only
+        >>> make_sample_data_random_ts(100, 3, end_date=end_date)
+
+        start date and end date
+        >>> make_sample_data_random_ts(100, 3, start_date=start_date, end_date=end_date)
+    """
+    if use_date_index:
+        if start_date is not None and end_date is not None:
+            date_index = pd.date_range(start_date, end_date)
+            if len(date_index) < n_rows:
+                e_date = start_date + datetime.timedelta(days=n_rows)
+                date_index = pd.date_range(start_date, e_date)
+            else:
+                date_index = date_index[:n_rows]
+        elif start_date is not None:
+            # date_range includes the start date
+            date_index = pd.date_range(start_date, start_date + datetime.timedelta(days=n_rows - 1))
+        elif end_date is not None:
+            date_index = pd.date_range(end_date - datetime.timedelta(days=n_rows - 1), end_date)
+        else:
+            today_date = datetime.date.today()
+            date_index = pd.date_range(today_date - datetime.timedelta(days=n_rows - 1), today_date)
+
+        if random_seed is not None:
+            np.random.seed(random_seed)
+        result_df = pd.DataFrame(np.random.rand(n_rows, n_columns),
+                                 index=date_index)
+    else:
+        result_df = pd.DataFrame(np.random.rand(n_rows, n_columns))
+
+    if column_labels is not None:
+        assert len(column_labels) == n_columns, 'column_labels not provided'
+        result_df.columns = column_labels
+
+    return result_df
 
 
 def make_sample_data_simple():
