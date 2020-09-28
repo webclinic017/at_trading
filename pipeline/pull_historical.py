@@ -94,6 +94,46 @@ def create_bigquery_price_table():
     ))
 
 
+def test_run(start_date, end_date):
+    """
+
+    :param start_date:
+    :param end_date:
+    usage:
+    >>> start_date = '2020-09-20'
+    >>> end_date = '2020-09-21'
+    """
+    logger = logging.getLogger(__name__)
+    date_range = pd.date_range(start_date, end_date)
+    app = ATIBApi()
+    # app.connect_local(port=7497)
+    app.connect_local()
+    api_thread = threading.Thread(target=app.run, daemon=True)
+    api_thread.start()
+    app.wait_till_connected()
+
+    for date_idx in range(len(date_range)):
+        if date_idx != len(date_range) - 1:
+            start_datetime = date_range[date_idx]
+            end_datetime = date_range[date_idx + 1]
+            logger.info('*******processing [{}] - [{}]*******'.format(start_datetime, end_datetime))
+            securities_group = 'vol'
+            data_source = 'ib'
+            data_dir = '/Users/b3yang/workspace/temp/data'
+            storage_path = 'prices'
+            bar_size = '5 secs'
+            data_type = 'TRADES'
+            run_pull_historical_data(securities_group,
+                                     data_source,
+                                     start_datetime,
+                                     end_datetime=end_datetime,
+                                     bar_size=bar_size,
+                                     data_type=data_type,
+                                     data_dir=data_dir,
+                                     upload_to_storage=True,
+                                     storage_path=storage_path, ib_app=app)
+
+
 def run_pull_historical_data(securities_group,
                              data_source,
                              start_datetime,
@@ -102,9 +142,12 @@ def run_pull_historical_data(securities_group,
                              data_type='TRADES',
                              data_dir=None,
                              upload_to_storage=True,
-                             storage_path='prices'):
+                             storage_path='prices',
+                             ib_app=None
+                             ):
     """
 
+    :param ib_app:
     :param securities_group:
     :param data_source:
     :param start_datetime:
@@ -117,21 +160,25 @@ def run_pull_historical_data(securities_group,
     usage:
         >>> securities_group = 'vol'
         >>> data_source = 'ib'
-        >>> start_datetime = datetime.datetime(2020, 7, 29)
-        >>> end_datetime = datetime.datetime(2020, 7, 30)
+        >>> start_datetime = datetime.datetime(2020, 9, 21)
+        >>> end_datetime = datetime.datetime(2020, 9, 20)
         >>> data_dir = '/Users/b3yang/workspace/temp/data'
         >>> upload_to_storage=True
         >>> storage_path = 'prices'
         >>> bar_size = '5 secs'
         >>> data_type = 'TRADES'
+        >>> ib_app= None
     """
     if data_source.lower() == 'ib':
-        app = ATIBApi()
-        # app.connect_local(port=7497)
-        app.connect_local()
-        api_thread = threading.Thread(target=app.run, daemon=True)
-        api_thread.start()
-        app.wait_till_connected()
+        if ib_app is None:
+            app = ATIBApi()
+            # app.connect_local(port=7497)
+            app.connect_local()
+            api_thread = threading.Thread(target=app.run, daemon=True)
+            api_thread.start()
+            app.wait_till_connected()
+        else:
+            app = ib_app
         # TODO: store to securities master database
         sec_dict = get_securities_dict_by_group(app, securities_group)
         if end_datetime is None:
@@ -163,73 +210,74 @@ def run_pull_historical_data(securities_group,
                                     full_path=os.path.join(data_dir, file_name),
                                     project_id=None)
             time.sleep(1)
-        app.disconnect()
+        if ib_app is None:
+            app.disconnect()
     else:
         raise Exception("only IB is supported at the moment")
 
-
-if __name__ == '__main__':
-    one_day = datetime.datetime.now() - datetime.timedelta(days=1)
-    one_day_date = datetime.datetime(one_day.year, one_day.month, one_day.day)
-
-    today_start = datetime.datetime.now()
-    today_start_date = datetime.datetime(today_start.year, today_start.month, today_start.day)
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
-    parser.add_argument(
-        '--securities-group',
-        default='vol',
-        help='Securities group, default to vol which contains VIX futures + VIX Index + SPX')
-    parser.add_argument(
-        '--data-source',
-        default='ib',
-        help='only supports IB at the moment')
-
-    parser.add_argument(
-        '--start-datetime',
-        default=one_day_date.strftime('%Y%m%d'),
-        help='start date time')
-
-    parser.add_argument(
-        '--end-datetime',
-        default=today_start_date.strftime('%Y%m%d'),
-        help='end date time')
-
-    parser.add_argument(
-        '--bar-size',
-        default='5 secs',
-        help='bar size')
-
-    parser.add_argument(
-        '--data-type',
-        default='TRADES',
-        help='data types')
-
-    parser.add_argument(
-        '--data-dir',
-        default='/Users/b3yang/workspace/temp/data/',
-        help='working directory for the parquet files being generated')
-
-    parser.add_argument(
-        '--upload-to-storage',
-        default=True,
-        help='upload to google storage')
-
-    parser.add_argument(
-        '--storage-path',
-        default='prices',
-        help='bucket folder under bucket at-ml-bucket')
-
-    args = parser.parse_args()
-
-    run_pull_historical_data(
-        securities_group=args.securities_group,
-        data_source=args.data_source,
-        start_datetime=datetime.datetime.strptime(args.start_datetime, '%Y%m%d'),
-        end_datetime=datetime.datetime.strptime(args.end_datetime, '%Y%m%d'),
-        bar_size=args.bar_size,
-        data_type=args.data_type,
-        data_dir=args.data_dir,
-        upload_to_storage=args.upload_to_storage,
-        storage_path=args.storage_path)
+#
+# if __name__ == '__main__':
+#     one_day = datetime.datetime.now() - datetime.timedelta(days=1)
+#     one_day_date = datetime.datetime(one_day.year, one_day.month, one_day.day)
+#
+#     today_start = datetime.datetime.now()
+#     today_start_date = datetime.datetime(today_start.year, today_start.month, today_start.day)
+#
+#     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+#
+#     parser.add_argument(
+#         '--securities-group',
+#         default='vol',
+#         help='Securities group, default to vol which contains VIX futures + VIX Index + SPX')
+#     parser.add_argument(
+#         '--data-source',
+#         default='ib',
+#         help='only supports IB at the moment')
+#
+#     parser.add_argument(
+#         '--start-datetime',
+#         default=one_day_date.strftime('%Y%m%d'),
+#         help='start date time')
+#
+#     parser.add_argument(
+#         '--end-datetime',
+#         default=today_start_date.strftime('%Y%m%d'),
+#         help='end date time')
+#
+#     parser.add_argument(
+#         '--bar-size',
+#         default='5 secs',
+#         help='bar size')
+#
+#     parser.add_argument(
+#         '--data-type',
+#         default='TRADES',
+#         help='data types')
+#
+#     parser.add_argument(
+#         '--data-dir',
+#         default='/Users/b3yang/workspace/temp/data/',
+#         help='working directory for the parquet files being generated')
+#
+#     parser.add_argument(
+#         '--upload-to-storage',
+#         default=True,
+#         help='upload to google storage')
+#
+#     parser.add_argument(
+#         '--storage-path',
+#         default='prices',
+#         help='bucket folder under bucket at-ml-bucket')
+#
+#     args = parser.parse_args()
+#
+#     run_pull_historical_data(
+#         securities_group=args.securities_group,
+#         data_source=args.data_source,
+#         start_datetime=datetime.datetime.strptime(args.start_datetime, '%Y%m%d'),
+#         end_datetime=datetime.datetime.strptime(args.end_datetime, '%Y%m%d'),
+#         bar_size=args.bar_size,
+#         data_type=args.data_type,
+#         data_dir=args.data_dir,
+#         upload_to_storage=args.upload_to_storage,
+#         storage_path=args.storage_path)

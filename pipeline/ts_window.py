@@ -5,17 +5,17 @@ import numpy as np
 from matplotlib import pyplot as plt
 import pandas as pd
 from matplotlib.figure import Figure
-from numpy import ma
 from tensorflow.python.ops.gen_dataset_ops import MapDataset
-
+import logging
 from pipeline.ts_feature import split_data_frame
-from pipeline.ts_sample_data import make_sample_data_simple, make_sample_data_ts, make_sample_data_random_ts
+from pipeline.ts_sample_data import make_sample_data_random_ts
 
 
 def split_window(input_features: tf.Tensor,
                  input_width: int,
                  label_width: int,
                  shift: int,
+                 input_column_indices: List[int] = None,
                  label_column_indices: List[int] = None) -> Tuple[tf.Tensor, tf.Tensor]:
     """
     given a stacked tensor, each represent a subset of timeseries data called batch,
@@ -43,6 +43,7 @@ def split_window(input_features: tf.Tensor,
     ray([[[3, 5]],
        [[4, 9]]])
 
+    :param input_column_indices:
     :param input_features:
     :param input_width:
     :param label_width:
@@ -66,8 +67,7 @@ def split_window(input_features: tf.Tensor,
     >>> split_window(input_features,
                  input_width = input_width,
                  label_width = label_width,
-                 shift = shift,
-                 label_indices = None)
+                 shift = shift)
 
     (<tf.Tensor: shape=(2, 2, 2), dtype=int32, numpy=
      array([[[1, 3],
@@ -113,6 +113,10 @@ def split_window(input_features: tf.Tensor,
     label_slice = slice(label_start, None)
     inputs = input_features[:, input_slice, :]
     labels = input_features[:, label_slice, :]
+    if input_column_indices is not None:
+        filtered_input_list = [inputs[:, :, idx] for idx in input_column_indices]
+        inputs = tf.stack(filtered_input_list, axis=-1)
+
     if label_column_indices is not None:
         filtered_label_list = [labels[:, :, idx] for idx in label_column_indices]
         labels = tf.stack(filtered_label_list, axis=-1)
@@ -230,9 +234,11 @@ class TSWindowGenerator(object):
         return rep_str
 
     def split_convert_to_data_set(self, input_df: pd.DataFrame,
+                                  input_column_indices: List[int] = None,
                                   label_column_indices: List[int] = None) -> Tuple[MapDataset, MapDataset]:
         """
 
+        :param input_column_indices:
         :param input_df:
         :param label_column_indices:
         :return:
@@ -256,7 +262,8 @@ class TSWindowGenerator(object):
             self.input_width,
             self.label_width,
             self.shift,
-            label_column_indices
+            input_column_indices=input_column_indices,
+            label_column_indices=label_column_indices
         ))
 
         # also generate index as well
@@ -276,6 +283,7 @@ class TSWindowGenerator(object):
             self.input_width,
             self.label_width,
             self.shift,
+            None,
             None
         ))
         return ds, ds_index
@@ -286,7 +294,11 @@ class TSDataStore(object):
                  window_generator: TSWindowGenerator,
                  in_df: pd.DataFrame,
                  split_dict: Dict = None,
-                 label_columns: List[str] = None):
+                 input_columns: List[str] = None,
+                 label_columns: List[str] = None,
+                 normalize: bool = True):
+        # TODO: split input and label columns
+        # TODO: support feature scaling
         self.window_generator = window_generator
         self.use_datetime_index = isinstance(in_df.index, pd.DatetimeIndex)
 
@@ -294,11 +306,26 @@ class TSDataStore(object):
         self.train_df = result_dict['train']
         self.val_df = result_dict['val']
         self.test_df = result_dict['test']
+        self.train_mean = None
+        self.train_vol = None
+        if normalize:
+            self.train_mean = self.train_df.mean()
+            self.train_vol = self.train_df.std()
+            self.train_df = self.train_df.sub(self.train_mean).div(self.train_vol)
+            self.val_df = self.val_df.sub(self.train_mean).div(self.train_vol)
+            self.test_df = self.test_df.sub(self.train_mean).div(self.train_vol)
 
         self.global_column_index_dict = dict(zip(
             in_df.columns.to_list(),
             list(range(len(in_df.columns)))
         ))
+
+        if input_columns is not None:
+            self.input_columns = input_columns
+            self.input_column_indices = [self.global_column_index_dict[x] for x in self.input_columns]
+        else:
+            self.input_columns = in_df.columns.to_list()
+            self.input_column_indices = None
 
         if label_columns is not None:
             self.label_columns = label_columns
@@ -314,15 +341,18 @@ class TSDataStore(object):
 
     @property
     def train(self) -> Tuple[MapDataset, MapDataset]:
-        return self.window_generator.split_convert_to_data_set(self.train_df)
+        return self.window_generator.split_convert_to_data_set(self.train_df, self.input_column_indices,
+                                                               self.label_column_indices)
 
     @property
     def val(self) -> Tuple[MapDataset, MapDataset]:
-        return self.window_generator.split_convert_to_data_set(self.val_df)
+        return self.window_generator.split_convert_to_data_set(self.val_df, self.input_column_indices,
+                                                               self.label_column_indices)
 
     @property
     def test(self) -> Tuple[MapDataset, MapDataset]:
-        return self.window_generator.split_convert_to_data_set(self.test_df)
+        return self.window_generator.split_convert_to_data_set(self.test_df, self.input_column_indices,
+                                                               self.label_column_indices)
 
     def compile_and_fit(self,
                         model,
@@ -386,39 +416,48 @@ class TSDataStore(object):
                 label_width = label_width,
                 shift = shift,
         )
-        >>> in_df = make_sample_data_random_ts(200, 3, random_seed=0)
+        >>> in_df = make_sample_data_random_ts(20, 5, random_seed=0, column_labels=['a', 'b', 'c', 'd', 'e'])
         >>> self = TSDataStore(window_generator=window_generator,
             in_df=in_df,
-            label_columns = [1, 2]
+            input_columns = ['a', 'b', 'c'],
+            label_columns = ['d', 'e']
         )
         >>> self.compile_and_fit(model)
+        >>> self.populate_predictions(mode=None)
         >>> mode = None
 
         """
+        logger = logging.getLogger(__name__)
         assert self.model is not None, 'please run compile_and_fit first'
         if mode is None:
             populate_list = ['train', 'val', 'test']
         else:
             populate_list = mode
 
-        label_column_indices_map = dict(zip(self.label_columns, self.label_column_indices))
+        label_column_indices_map = dict(zip(self.label_columns, list(range(len(self.label_columns)))))
         for populate_item in populate_list:
+            logger.info('populating prediction on [{}] data set'.format(populate_item))
             data, data_index = getattr(self, populate_item)
+            logger.info('after getattr')
             df_list = []
             for map_item, label_item in zip(data.as_numpy_iterator(), data_index.as_numpy_iterator()):
+                logger.info('after zip iterator')
                 input_data, label_data = map_item
                 input_data_index, label_data_index = label_item
                 predictions = self.model(input_data)
                 label_dict = {}
                 for label_c in self.label_columns:
                     label_dict[label_c] = pd.DataFrame({
-                        'prediction': predictions[:, label_column_indices_map[label_c]],
+                        'prediction': predictions[:, :, label_column_indices_map[label_c]].numpy().flatten(),
                         'actual': label_data[:, :, label_column_indices_map[label_c]].flatten()
                     }, index=np.vectorize(datetime.datetime.fromtimestamp)(
                         label_data_index.flatten()))
+                    logger.info('after zip dataframe')
                 df_list.append(
                     pd.concat(label_dict, axis=1)
                 )
+                logger.info('after concat')
+
             setattr(self, '{}_prediction_df'.format(populate_item), pd.concat(df_list))
 
     # plotting functions to visualize the data stored
