@@ -10,7 +10,7 @@ import time
 import threading
 import logging
 import pandas as pd
-from google.cloud import bigquery
+# from google.cloud import bigquery
 
 from at_trading.gcp.config import GCP_PROJECT_ID
 from at_trading.gcp.gcp_storage import storage_upload_file
@@ -23,6 +23,19 @@ from at_trading.util.util_data_structure import to_parquet_table_from_df
 
 
 def get_securities_dict_by_group(ib_app, securities_group):
+    """
+
+    :param ib_app:
+    :param securities_group:
+    :return:
+    usage:
+        >>> ib_app = ATIBApi()
+        # app.connect_local(port=7497)
+        >>> ib_app.connect_local()
+        >>> api_thread = threading.Thread(target=ib_app.run, daemon=True)
+        >>> api_thread.start()
+        >>> ib_app.wait_till_connected()
+    """
     result_sec_dict = {}
     if securities_group == 'vol':
         result_sec_dict['spx'] = gen_contract('SPX', 'IND', 'CBOE', 'USD')
@@ -43,7 +56,24 @@ def get_securities_dict_by_group(ib_app, securities_group):
                     'lastTradeDateOrContractMonth': data['contract.lastTradeDateOrContractMonth']
                 }
             )
-        return result_sec_dict
+    elif securities_group == 'btc':
+        bitcoin_futures = ib_app.req_contract_details_futures('BRR', exchange='CMECRYPTO',
+                                                              summary_only=True)
+        bitcoin_futures_df = pd.DataFrame(bitcoin_futures).sort_values('contract.lastTradeDateOrContractMonth')
+        bitcoin_futures_df = bitcoin_futures_df[bitcoin_futures_df['marketName'] == 'BTC'].head(3)
+        for irow, data in bitcoin_futures_df.iterrows():
+            result_sec_dict[data['contract.localSymbol'].lower()] = gen_contract(
+                symbol=data['contract.symbol'],
+                sec_type=data['contract.secType'],
+                exchange=data['contract.exchange'],
+                currency=data['contract.currency'],
+                other_param_dict={
+                    'localSymbol': data['contract.localSymbol'],
+                    'lastTradeDateOrContractMonth': data['contract.lastTradeDateOrContractMonth']
+                }
+            )
+
+    return result_sec_dict
 
 
 @DeprecationWarning
@@ -94,14 +124,17 @@ def create_bigquery_price_table():
     ))
 
 
-def test_run(start_date, end_date):
+def test_run(start_date, end_date, security_group):
     """
 
+    :param security_group:
     :param start_date:
     :param end_date:
     usage:
-    >>> start_date = '2020-09-20'
-    >>> end_date = '2020-09-21'
+    >>> start_date = '2020-09-21'
+    >>> end_date = '2020-09-22'
+    >>> security_group = 'btc'
+
     """
     logger = logging.getLogger(__name__)
     date_range = pd.date_range(start_date, end_date)
@@ -117,7 +150,7 @@ def test_run(start_date, end_date):
             start_datetime = date_range[date_idx]
             end_datetime = date_range[date_idx + 1]
             logger.info('*******processing [{}] - [{}]*******'.format(start_datetime, end_datetime))
-            securities_group = 'vol'
+            securities_group = security_group
             data_source = 'ib'
             data_dir = '/Users/b3yang/workspace/temp/data'
             storage_path = 'prices'
@@ -161,7 +194,7 @@ def run_pull_historical_data(securities_group,
         >>> securities_group = 'vol'
         >>> data_source = 'ib'
         >>> start_datetime = datetime.datetime(2020, 9, 21)
-        >>> end_datetime = datetime.datetime(2020, 9, 20)
+        >>> end_datetime = datetime.datetime(2020, 9, 22)
         >>> data_dir = '/Users/b3yang/workspace/temp/data'
         >>> upload_to_storage=True
         >>> storage_path = 'prices'
