@@ -14,10 +14,7 @@ from at_trading.ib.ib_api import ATIBApi
 app = Flask(__name__)
 CORS(app)
 app_ib = ATIBApi()
-app_ib.connect_local()
-api_thread = threading.Thread(target=app_ib.run, daemon=True)
-api_thread.start()
-time.sleep(1)
+app_ib.connect_local(port=7497)
 
 
 @app.route('/subscribe/<ticker>', methods=['GET'])

@@ -10,3 +10,6 @@ twine
 pytest
 pytest-runner
 ibapi
+apache-beam[gcp]
+tensorflow-transform
+tensorflow
